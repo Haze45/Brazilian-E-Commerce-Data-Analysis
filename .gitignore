@@ -1,0 +1,48 @@
+# ── Environment — NEVER push ──────────────────────────────
+.env
+
+# ── Dataset CSVs — too large for GitHub ───────────────────
+data/
+*.zip
+*.csv
+
+# ── Trained ML models — regenerate with train_all.py ──────
+models/*.pkl
+models/*.json
+models/*.csv
+
+# ── MLflow database ────────────────────────────────────────
+mlflow_tracking/mlflow.db
+mlruns/
+
+# ── Python cache ───────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ── Virtual environments ───────────────────────────────────
+.venv/
+venv/
+env/
+.idea/
+# ── Jupyter checkpoints ────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Power BI ───────────────────────────────────────────────
+*.pbix
+
+# ── VS Code ────────────────────────────────────────────────
+.vscode/
+
+# ── Windows system files ───────────────────────────────────
+Thumbs.db
+desktop.ini
+
+# ── uv ─────────────────────────────────────────────────────
+.python-version
+uv.lock
+
+# ── Logs ───────────────────────────────────────────────────
+*.log
+*.tmp
