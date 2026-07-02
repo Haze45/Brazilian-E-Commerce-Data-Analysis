@@ -16,6 +16,7 @@ xgboost==2.0.3
 prophet==1.1.7
 joblib==1.4.2
 cmdstanpy==1.2.5
+imbalanced-learn
 
 # Experiment tracking
 mlflow==2.13.0
