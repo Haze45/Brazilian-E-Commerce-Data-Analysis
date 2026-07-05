@@ -11,10 +11,14 @@ Fixes applied:
   - model saved using prophet.serialize (model_to_json / model_from_json)
     instead of joblib — avoids 'stan_backend' pickling error on Windows
 
-Note on data:
-  Only 24 monthly data points available (2016-08-31 to 2018-08-31).
-  Prophet typically needs 2+ full seasonal cycles for reliable yearly
-  seasonality. Results should be treated as indicative, not precise.
+Improvements v2:
+  - Disabled yearly_seasonality (only 24 months — not enough data)
+  - Added monthly seasonality manually (30-day period)
+  - Changed to additive mode (more stable with limited data)
+  - Increased changepoint_prior_scale for better trend flexibility
+  - Confidence intervals in predict() response
+  - model_to_json / model_from_json (avoids joblib stan_backend error)
+  - tz_localize(None) to strip PostgreSQL timezone
 """
 
 import os, sys
@@ -29,13 +33,11 @@ from prophet.serialize import model_to_json, model_from_json
 from prophet.diagnostics import cross_validation, performance_metrics
 from config import PG_URL, MODELS_DIR, MLFLOW_TRACKING_URI, MLFLOW_EXPERIMENT
 
-engine = create_engine(PG_URL)
-
+engine    = create_engine(PG_URL)
 MODEL_PATH    = os.path.join(MODELS_DIR, "forecast_model.json")
 FORECAST_PATH = os.path.join(MODELS_DIR, "forecast_results.csv")
 
 
-# ── DATA ──────────────────────────────────────────────────────────────────────
 def load_monthly_revenue() -> pd.DataFrame:
     sql = """
     SELECT
@@ -48,7 +50,6 @@ def load_monthly_revenue() -> pd.DataFrame:
     with engine.connect() as conn:
         df = pd.read_sql(text(sql), conn)
 
-    # Strip timezone — Prophet does not accept tz-aware timestamps
     df["ds"] = pd.to_datetime(df["ds"]).dt.tz_localize(None)
     df["y"]  = df["y"].astype(float)
 
@@ -58,31 +59,36 @@ def load_monthly_revenue() -> pd.DataFrame:
     return df
 
 
-# ── TRAIN ─────────────────────────────────────────────────────────────────────
 def train(periods: int = 6):
     print("\n── Sales Revenue Forecasting ─────────────────────")
     df = load_monthly_revenue()
 
+    # yearly_seasonality=False — only 24 months, not enough for reliable yearly cycle
+    # Monthly seasonality added manually — we have enough months for this
     model = Prophet(
-        yearly_seasonality=True,
+        yearly_seasonality=False,
         weekly_seasonality=False,
         daily_seasonality=False,
-        seasonality_mode="multiplicative",
-        changepoint_prior_scale=0.05,
-        interval_width=0.95,       # 95% confidence interval
+        seasonality_mode="additive",
+        changepoint_prior_scale=0.1,
+        interval_width=0.95,
+    )
+    model.add_seasonality(
+        name="monthly",
+        period=30.5,
+        fourier_order=3,
     )
 
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
-    with mlflow.start_run(run_name="sales_forecast_prophet"):
+    with mlflow.start_run(run_name="sales_forecast_prophet_v2"):
         model.fit(df)
 
-        # Forecast
         future   = model.make_future_dataframe(periods=periods, freq="MS")
         forecast = model.predict(future)
 
-        # Cross-validation (may fail with small dataset — handled gracefully)
+        mae = rmse = mape = 0.0
         try:
             cv_df      = cross_validation(
                 model,
@@ -95,29 +101,27 @@ def train(periods: int = 6):
             mae  = float(metrics_df["mae"].mean())
             rmse = float(metrics_df["rmse"].mean())
             mape = float(metrics_df["mape"].mean())
+            print(f"\n  MAE  : ${mae:,.2f}")
+            print(f"  RMSE : ${rmse:,.2f}")
+            print(f"  MAPE : {mape*100:.2f}%")
         except Exception as e:
             print(f"  Cross-validation skipped: {e}")
-            mae = rmse = mape = 0.0
 
         mlflow.log_params({
-            "model"                   : "Prophet",
-            "periods"                 : periods,
-            "seasonality_mode"        : "multiplicative",
-            "changepoint_prior_scale" : 0.05,
+            "model"                   : "Prophet v2",
+            "yearly_seasonality"      : False,
+            "monthly_seasonality"     : True,
+            "seasonality_mode"        : "additive",
+            "changepoint_prior_scale" : 0.1,
             "interval_width"          : 0.95,
-            "data_note"               : "24 months only — yearly seasonality may be unreliable",
+            "fix"                     : "disabled yearly seasonality — only 24 months",
         })
         mlflow.log_metrics({"mae": mae, "rmse": rmse, "mape": mape})
 
-        print(f"\n  MAE  : ${mae:,.2f}")
-        print(f"  RMSE : ${rmse:,.2f}")
-        print(f"  MAPE : {mape*100:.2f}%")
-
-        # Show forecast with confidence intervals
         future_only = forecast[forecast["ds"] > df["ds"].max()][
             ["ds", "yhat", "yhat_lower", "yhat_upper"]
         ]
-        print(f"\n  Forecast next {periods} months (95% confidence interval):")
+        print(f"\n  Forecast next {periods} months (95% CI):")
         for _, row in future_only.iterrows():
             print(
                 f"    {row['ds'].strftime('%Y-%m')}  →  "
@@ -125,28 +129,19 @@ def train(periods: int = 6):
                 f"[${row['yhat_lower']:,.2f} – ${row['yhat_upper']:,.2f}]"
             )
 
-    # Save model using Prophet's own JSON serializer (not joblib)
     with open(MODEL_PATH, "w") as f:
         f.write(model_to_json(model))
 
-    # Save full forecast CSV including confidence intervals
     forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].to_csv(
         FORECAST_PATH, index=False
     )
 
     print(f"\n  Model saved   → models/forecast_model.json")
     print(f"  Forecast CSV  → models/forecast_results.csv")
-
     return model, forecast
 
 
-# ── PREDICT ───────────────────────────────────────────────────────────────────
 def predict(periods: int = 6) -> list[dict]:
-    """
-    Load saved model and return forecast for next N months.
-    Returns list of dicts with month, forecast, lower_bound, upper_bound.
-    Confidence intervals (95%) communicate forecast uncertainty honestly.
-    """
     with open(MODEL_PATH, "r") as f:
         model = model_from_json(f.read())
 
@@ -162,8 +157,8 @@ def predict(periods: int = 6) -> list[dict]:
         {
             "month"      : row["ds"].strftime("%Y-%m"),
             "forecast"   : round(float(row["yhat"]), 2),
-            "lower_bound": round(float(row["yhat_lower"]), 2),   # 95% CI lower
-            "upper_bound": round(float(row["yhat_upper"]), 2),   # 95% CI upper
+            "lower_bound": round(float(row["yhat_lower"]), 2),
+            "upper_bound": round(float(row["yhat_upper"]), 2),
         }
         for _, row in future_only.iterrows()
     ]

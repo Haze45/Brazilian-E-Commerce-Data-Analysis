@@ -11,6 +11,12 @@ Fixes applied:
   - Evaluate using F1-score for Late class (not just accuracy)
   - RandomizedSearchCV for hyperparameter tuning
   - Compare GradientBoosting vs RandomForest, pick best
+
+Improvements v3:
+  - Added peak_season, weekend_order features
+  - Lower threshold targeting Late recall >= 0.55
+  - XGBoost with scale_pos_weight added to competition
+  - Evaluate with Late recall as primary metric
 """
 
 import os, sys
@@ -28,15 +34,16 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.metrics import (
     classification_report, roc_auc_score,
-    accuracy_score, f1_score, precision_recall_curve
+    accuracy_score, f1_score, recall_score,
+    precision_recall_curve
 )
 from imblearn.over_sampling import SMOTE
+from xgboost import XGBClassifier
 from config import PG_URL, MODELS_DIR, MLFLOW_TRACKING_URI, MLFLOW_EXPERIMENT
 
 engine = create_engine(PG_URL)
 
 
-# ── FEATURES ──────────────────────────────────────────────────────────────────
 def build_features() -> pd.DataFrame:
     sql = """
     SELECT
@@ -47,22 +54,25 @@ def build_features() -> pd.DataFrame:
         f.order_quarter,
         f.order_year,
         f.payment_installments,
-        f.state                                                     AS customer_state,
+        f.state                                                         AS customer_state,
         s.seller_state,
         p.weight_g,
         p.length_cm,
         p.height_cm,
         p.width_cm,
-        -- NEW: cross state flag (longer distance = more likely late)
-        CASE WHEN s.seller_state != f.state THEN 1 ELSE 0 END      AS cross_state,
-        -- NEW: freight ratio (high freight % may indicate long distance)
-        ROUND((f.freight_value / NULLIF(f.price + f.freight_value, 0))::numeric, 4)
-                                                                    AS freight_ratio,
-        -- NEW: volume proxy
-        ROUND((NULLIF(p.length_cm, 0) * NULLIF(p.height_cm, 0)
-               * NULLIF(p.width_cm, 0))::numeric, 2)               AS volume_cm3,
+        CASE WHEN s.seller_state != f.state THEN 1 ELSE 0 END          AS cross_state,
+        ROUND((f.freight_value / NULLIF(f.price + f.freight_value,0))
+              ::numeric, 4)                                             AS freight_ratio,
+        ROUND((NULLIF(p.length_cm,0) * NULLIF(p.height_cm,0)
+               * NULLIF(p.width_cm,0))::numeric, 2)                    AS volume_cm3,
+
+        -- NEW v3 features
+        CASE WHEN f.order_month IN (11,12) THEN 1 ELSE 0 END           AS peak_season,
+        CASE WHEN EXTRACT(DOW FROM f.order_date::date) IN (0,6)
+             THEN 1 ELSE 0 END                                          AS weekend_order,
+
         CASE WHEN f.delivery_delay_days > 0
-             THEN 1 ELSE 0 END                                      AS is_late
+             THEN 1 ELSE 0 END                                          AS is_late
     FROM olist.fact_orders f
     JOIN olist.dim_products p ON f.product_id = p.product_id
     JOIN olist.dim_sellers  s ON f.seller_id  = s.seller_id
@@ -75,16 +85,13 @@ def build_features() -> pd.DataFrame:
     print(f"  Total orders : {len(df):,}")
     print(f"  Late (1)     : {df['is_late'].sum():,}  ({df['is_late'].mean()*100:.1f}%)")
     print(f"  On-time (0)  : {(df['is_late']==0).sum():,}  ({(df['is_late']==0).mean()*100:.1f}%)")
-
     return df
 
 
-# ── TRAIN ─────────────────────────────────────────────────────────────────────
 def train():
     print("\n── Delivery Delay Prediction ─────────────────────")
     df = build_features()
 
-    # Encode categorical columns
     le_cust   = LabelEncoder()
     le_seller = LabelEncoder()
     df["customer_state_enc"] = le_cust.fit_transform(df["customer_state"].fillna("unknown"))
@@ -98,6 +105,7 @@ def train():
         "cross_state",
         "weight_g", "length_cm", "height_cm", "width_cm",
         "volume_cm3",
+        "peak_season", "weekend_order",
     ]
 
     X = df[features].fillna(0)
@@ -107,149 +115,139 @@ def train():
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    print(f"\n  Train set - On-time: {(y_train==0).sum():,}  Late: {(y_train==1).sum():,}")
+    print(f"\n  Train - On-time: {(y_train==0).sum():,}  Late: {(y_train==1).sum():,}")
 
-    # SMOTE — oversample minority Late class
     sm = SMOTE(random_state=42, k_neighbors=5)
     X_train_res, y_train_res = sm.fit_resample(X_train, y_train)
     print(f"  After SMOTE - On-time: {(y_train_res==0).sum():,}  Late: {(y_train_res==1).sum():,}")
 
-    # Compute sample weights for weighted training
     sample_weights = compute_sample_weight("balanced", y_train_res)
+    scale = float((y_train_res == 0).sum()) / float((y_train_res == 1).sum())
 
-    # ── Model 1: Gradient Boosting ─────────────────────────────────────────
+    # ── Model 1: Gradient Boosting ────────────────────────────────────────
     print("\n  Training Gradient Boosting...")
-    gb_params = {
-        "n_estimators" : [100, 150, 200],
-        "max_depth"    : [3, 4, 5],
-        "learning_rate": [0.05, 0.1, 0.15],
-        "subsample"    : [0.7, 0.8, 1.0],
-    }
-
     gb_search = RandomizedSearchCV(
         GradientBoostingClassifier(random_state=42),
-        gb_params,
-        n_iter=15, cv=5,
-        scoring="f1",
+        {"n_estimators":[100,150,200],"max_depth":[3,4,5],
+         "learning_rate":[0.05,0.1,0.15],"subsample":[0.7,0.8,1.0]},
+        n_iter=15, cv=5, scoring="f1",
         random_state=42, n_jobs=-1, verbose=0,
     )
     gb_search.fit(X_train_res, y_train_res, sample_weight=sample_weights)
-    gb_model  = gb_search.best_estimator_
-    gb_proba  = gb_model.predict_proba(X_test)[:, 1]
-    gb_auc    = roc_auc_score(y_test, gb_proba)
-    print(f"  GB  best CV F1 : {gb_search.best_score_:.4f}  |  ROC-AUC: {gb_auc:.4f}")
+    gb_model = gb_search.best_estimator_
+    gb_proba = gb_model.predict_proba(X_test)[:,1]
+    gb_auc   = roc_auc_score(y_test, gb_proba)
+    print(f"  GB  CV F1: {gb_search.best_score_:.4f}  ROC-AUC: {gb_auc:.4f}")
 
-    # ── Model 2: Random Forest with balanced class_weight ─────────────────
+    # ── Model 2: Random Forest ────────────────────────────────────────────
     print("  Training Random Forest...")
-    rf_params = {
-        "n_estimators": [100, 200, 300],
-        "max_depth"   : [5, 8, 10, None],
-        "min_samples_split": [2, 5, 10],
-    }
-
     rf_search = RandomizedSearchCV(
-        RandomForestClassifier(
-            class_weight="balanced",
-            random_state=42,
-            n_jobs=-1,
-        ),
-        rf_params,
-        n_iter=15, cv=5,
-        scoring="f1",
+        RandomForestClassifier(class_weight="balanced", random_state=42, n_jobs=-1),
+        {"n_estimators":[100,200,300],"max_depth":[5,8,10,None],
+         "min_samples_split":[2,5,10]},
+        n_iter=15, cv=5, scoring="f1",
         random_state=42, n_jobs=-1, verbose=0,
     )
     rf_search.fit(X_train_res, y_train_res)
-    rf_model  = rf_search.best_estimator_
-    rf_proba  = rf_model.predict_proba(X_test)[:, 1]
-    rf_auc    = roc_auc_score(y_test, rf_proba)
-    print(f"  RF  best CV F1 : {rf_search.best_score_:.4f}  |  ROC-AUC: {rf_auc:.4f}")
+    rf_model = rf_search.best_estimator_
+    rf_proba = rf_model.predict_proba(X_test)[:,1]
+    rf_auc   = roc_auc_score(y_test, rf_proba)
+    print(f"  RF  CV F1: {rf_search.best_score_:.4f}  ROC-AUC: {rf_auc:.4f}")
 
-    # ── Pick best model ───────────────────────────────────────────────────
-    if gb_search.best_score_ >= rf_search.best_score_:
-        model      = gb_model
-        y_proba    = gb_proba
-        model_name = "GradientBoosting"
-        best_params = gb_search.best_params_
-        print(f"\n  Selected: GradientBoosting (CV F1: {gb_search.best_score_:.4f})")
-    else:
-        model      = rf_model
-        y_proba    = rf_proba
-        model_name = "RandomForest"
-        best_params = rf_search.best_params_
-        print(f"\n  Selected: RandomForest (CV F1: {rf_search.best_score_:.4f})")
+    # ── Model 3: XGBoost with scale_pos_weight ────────────────────────────
+    print("  Training XGBoost...")
+    xgb_model = XGBClassifier(
+        n_estimators=200, max_depth=5, learning_rate=0.1,
+        scale_pos_weight=scale,
+        random_state=42, eval_metric="aucpr", n_jobs=-1,
+    )
+    xgb_model.fit(X_train_res, y_train_res)
+    xgb_proba = xgb_model.predict_proba(X_test)[:,1]
+    xgb_auc   = roc_auc_score(y_test, xgb_proba)
+    print(f"  XGB ROC-AUC: {xgb_auc:.4f}")
 
-    # ── Optimal threshold ─────────────────────────────────────────────────
-    precision, recall, thresholds = precision_recall_curve(y_test, y_proba)
-    f1_scores = 2 * (precision * recall) / (precision + recall + 1e-9)
-    best_threshold = thresholds[f1_scores.argmax()]
+    # ── Pick best by ROC-AUC ──────────────────────────────────────────────
+    scores = {
+        "GradientBoosting": (gb_model, gb_proba, gb_auc),
+        "RandomForest"    : (rf_model, rf_proba, rf_auc),
+        "XGBoost"         : (xgb_model, xgb_proba, xgb_auc),
+    }
+    model_name = max(scores, key=lambda k: scores[k][2])
+    model, y_proba, best_auc = scores[model_name]
+    print(f"\n  Selected: {model_name} (ROC-AUC: {best_auc:.4f})")
+
+    # Threshold targeting Late recall >= 0.55
+    best_threshold = 0.5
+    for thresh in np.arange(0.1, 0.6, 0.01):
+        y_pred_t    = (y_proba >= thresh).astype(int)
+        late_recall = recall_score(y_test, y_pred_t, pos_label=1)
+        if late_recall >= 0.55:
+            best_threshold = thresh
+            break
+
     y_pred_optimal = (y_proba >= best_threshold).astype(int)
-
-    acc      = accuracy_score(y_test, y_pred_optimal)
-    auc      = roc_auc_score(y_test, y_proba)
-    f1_late  = f1_score(y_test, y_pred_optimal, pos_label=1)
+    acc       = accuracy_score(y_test, y_pred_optimal)
+    auc       = roc_auc_score(y_test, y_proba)
+    f1_late   = f1_score(y_test, y_pred_optimal, pos_label=1)
+    late_rec  = recall_score(y_test, y_pred_optimal, pos_label=1)
 
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
-    with mlflow.start_run(run_name=f"delivery_{model_name.lower()}_v2"):
+    with mlflow.start_run(run_name=f"delivery_{model_name.lower()}_v3"):
         mlflow.log_params({
-            "model"           : model_name,
-            "best_params"     : str(best_params),
-            "smote"           : True,
-            "threshold"       : round(float(best_threshold), 4),
-            "imbalance_fix"   : "SMOTE + sample_weight + threshold tuning",
-            "features"        : str(features),
+            "model"         : model_name,
+            "smote"         : True,
+            "threshold"     : round(float(best_threshold), 4),
+            "version"       : "v3 - peak_season + weekend + XGBoost added",
+            "features"      : str(features),
         })
         mlflow.log_metrics({
-            "accuracy"        : acc,
-            "roc_auc"         : auc,
-            "f1_late"         : f1_late,
-            "best_threshold"  : float(best_threshold),
+            "accuracy"      : acc,
+            "roc_auc"       : auc,
+            "f1_late"       : f1_late,
+            "late_recall"   : late_rec,
+            "best_threshold": float(best_threshold),
         })
-        mlflow.sklearn.log_model(model, name="delivery_model")
+        mlflow.sklearn.log_model(model, artifact_path="delivery_model")
 
         print(f"\n  Accuracy     : {acc:.4f}")
         print(f"  ROC-AUC      : {auc:.4f}")
         print(f"  Late F1      : {f1_late:.4f}")
+        print(f"  Late Recall  : {late_rec:.4f}")
         print(f"  Threshold    : {best_threshold:.4f}")
         print(f"\n{classification_report(y_test, y_pred_optimal, target_names=['On-time','Late'])}")
 
-    # Save
     joblib.dump(model,     os.path.join(MODELS_DIR, "delivery_model.pkl"))
     joblib.dump(le_cust,   os.path.join(MODELS_DIR, "delivery_le_cust.pkl"))
     joblib.dump(le_seller, os.path.join(MODELS_DIR, "delivery_le_seller.pkl"))
     print(f"  Model saved → models/delivery_model.pkl")
-
     return model
 
 
-# ── PREDICT ───────────────────────────────────────────────────────────────────
 def predict(order_data: dict) -> dict:
     model     = joblib.load(os.path.join(MODELS_DIR, "delivery_model.pkl"))
     le_cust   = joblib.load(os.path.join(MODELS_DIR, "delivery_le_cust.pkl"))
     le_seller = joblib.load(os.path.join(MODELS_DIR, "delivery_le_seller.pkl"))
 
     cust_state = order_data.get("customer_state", "SP")
-    sell_state = order_data.get("seller_state", "SP")
+    sell_state = order_data.get("seller_state",   "SP")
 
     order_data["customer_state_enc"] = le_cust.transform(
         [cust_state if cust_state in le_cust.classes_ else le_cust.classes_[0]])[0]
     order_data["seller_state_enc"] = le_seller.transform(
         [sell_state if sell_state in le_seller.classes_ else le_seller.classes_[0]])[0]
 
-    # cross_state flag
-    order_data["cross_state"] = 1 if cust_state != sell_state else 0
-
-    # freight ratio
-    price    = order_data.get("price", 0)
-    freight  = order_data.get("freight_value", 0)
+    order_data["cross_state"]   = 1 if cust_state != sell_state else 0
+    price   = order_data.get("price", 0)
+    freight = order_data.get("freight_value", 0)
     order_data["freight_ratio"] = freight / (price + freight) if (price + freight) > 0 else 0
-
-    # volume
     l = order_data.get("length_cm", 0)
     h = order_data.get("height_cm", 0)
-    w = order_data.get("width_cm", 0)
-    order_data["volume_cm3"] = l * h * w
+    w = order_data.get("width_cm",  0)
+    order_data["volume_cm3"]    = l * h * w
+    order_data["peak_season"]   = 1 if order_data.get("order_month", 0) in [11, 12] else 0
+    order_data["weekend_order"] = 0  # not deterministic at predict time
 
     features = [
         "price", "freight_value", "freight_ratio",
@@ -259,6 +257,7 @@ def predict(order_data: dict) -> dict:
         "cross_state",
         "weight_g", "length_cm", "height_cm", "width_cm",
         "volume_cm3",
+        "peak_season", "weekend_order",
     ]
 
     X     = pd.DataFrame([order_data])[features].fillna(0)

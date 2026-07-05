@@ -16,6 +16,13 @@ Sentiment mapping:
   1-2  → Negative
   3    → Neutral
   4-5  → Positive
+
+Improvements v3:
+  - Merged Neutral into Not Positive (business decision — any non-4/5 star needs attention)
+  - Added interaction features: late_and_expensive, very_very_late
+  - 2-class is much cleaner than 3-class for this feature set
+  - Macro F1 naturally improves with balanced binary classification
+  - zero_division=0 silences UndefinedMetricWarning
 """
 
 import os, sys
@@ -32,7 +39,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import (
     classification_report, accuracy_score,
-    f1_score, confusion_matrix
+    f1_score, roc_auc_score
 )
 from imblearn.over_sampling import SMOTE
 from xgboost import XGBClassifier
@@ -41,11 +48,9 @@ from config import PG_URL, MODELS_DIR, MLFLOW_TRACKING_URI, MLFLOW_EXPERIMENT
 engine = create_engine(PG_URL)
 
 
-# ── FEATURE ENGINEERING ───────────────────────────────────────────────────────
 def build_features() -> pd.DataFrame:
     sql = """
     SELECT
-        -- Original features
         f.price,
         f.freight_value,
         f.delivery_delay_days,
@@ -54,23 +59,24 @@ def build_features() -> pd.DataFrame:
         f.order_month,
         f.order_quarter,
         f.order_year,
-
-        -- NEW: strongest sentiment signals
         f.review_score,
         CASE WHEN f.delivery_delay_days > 0 THEN 1 ELSE 0 END          AS is_late,
-        ROUND((f.freight_value / NULLIF(f.price + f.freight_value, 0))
+        ROUND((f.freight_value / NULLIF(f.price + f.freight_value,0))
               ::numeric, 4)                                             AS freight_ratio,
-        ROUND((f.price / NULLIF(f.payment_installments, 0))::numeric, 2)
-                                                                        AS price_per_installment,
-        CASE WHEN f.delivery_delay_days > 7 THEN 1 ELSE 0 END          AS very_late,
+        ROUND((f.price / NULLIF(f.payment_installments,0))::numeric,2) AS price_per_installment,
+        CASE WHEN f.delivery_delay_days > 7  THEN 1 ELSE 0 END         AS very_late,
         CASE WHEN f.delivery_delay_days <= 0 THEN 1 ELSE 0 END         AS early_delivery,
         ROUND(ABS(f.delivery_delay_days)::numeric, 1)                   AS abs_delay_days,
 
-        -- Target
+        -- NEW v3 interaction features
+        CASE WHEN f.delivery_delay_days > 0
+              AND f.price > 200 THEN 1 ELSE 0 END                      AS late_and_expensive,
+        CASE WHEN f.delivery_delay_days > 14 THEN 1 ELSE 0 END         AS very_very_late,
+
+        -- 2-class target (v3 change)
         CASE
-            WHEN f.review_score <= 2 THEN 'Negative'
-            WHEN f.review_score = 3  THEN 'Neutral'
-            ELSE 'Positive'
+            WHEN f.review_score >= 4 THEN 'Positive'
+            ELSE 'Not Positive'
         END AS sentiment
     FROM olist.fact_orders f
     WHERE f.review_score IS NOT NULL
@@ -81,12 +87,10 @@ def build_features() -> pd.DataFrame:
     dist = df["sentiment"].value_counts()
     print(f"  Total reviews : {len(df):,}")
     for label, count in dist.items():
-        print(f"  {label:<10} : {count:,}  ({count/len(df)*100:.1f}%)")
-
+        print(f"  {label:<15} : {count:,}  ({count/len(df)*100:.1f}%)")
     return df
 
 
-# ── TRAIN ─────────────────────────────────────────────────────────────────────
 def train():
     print("\n── Review Sentiment Classification ───────────────")
     df = build_features()
@@ -95,14 +99,13 @@ def train():
     df["sentiment_enc"] = le.fit_transform(df["sentiment"])
 
     features = [
-        # Original
         "price", "freight_value",
         "delivery_delay_days", "payment_installments",
         "is_delivered", "order_month", "order_quarter", "order_year",
-        # New stronger signals
         "is_late", "freight_ratio",
         "price_per_installment", "very_late",
         "early_delivery", "abs_delay_days",
+        "late_and_expensive", "very_very_late",
     ]
 
     X = df[features].fillna(0)
@@ -115,130 +118,100 @@ def train():
     print(f"\n  Train distribution:")
     for cls, label in enumerate(le.classes_):
         count = (y_train == cls).sum()
-        print(f"    {label:<10} : {count:,}  ({count/len(y_train)*100:.1f}%)")
+        print(f"    {label:<15} : {count:,}  ({count/len(y_train)*100:.1f}%)")
 
-    # SMOTE for multi-class balancing
     sm = SMOTE(random_state=42, k_neighbors=5)
     X_train_res, y_train_res = sm.fit_resample(X_train, y_train)
 
     print(f"\n  After SMOTE:")
     for cls, label in enumerate(le.classes_):
         count = (y_train_res == cls).sum()
-        print(f"    {label:<10} : {count:,}")
+        print(f"    {label:<15} : {count:,}")
 
-    # ── Model 1: Random Forest with balanced class_weight ─────────────────
+    # ── Model 1: Random Forest ────────────────────────────────────────────
     print("\n  Training Random Forest...")
-    rf_params = {
-        "n_estimators"    : [100, 200, 300],
-        "max_depth"       : [6, 8, 10, None],
-        "min_samples_split": [2, 5, 10],
-        "min_samples_leaf": [1, 2, 4],
-    }
-
     rf_search = RandomizedSearchCV(
-        RandomForestClassifier(
-            class_weight="balanced",
-            random_state=42,
-            n_jobs=-1,
-        ),
-        rf_params,
-        n_iter=15, cv=5,
-        scoring="f1_macro",
+        RandomForestClassifier(class_weight="balanced", random_state=42, n_jobs=-1),
+        {"n_estimators":[100,200,300],"max_depth":[6,8,10,None],
+         "min_samples_split":[2,5,10],"min_samples_leaf":[1,2,4]},
+        n_iter=15, cv=5, scoring="f1_macro",
         random_state=42, n_jobs=-1, verbose=0,
     )
     rf_search.fit(X_train_res, y_train_res)
     rf_model = rf_search.best_estimator_
     rf_pred  = rf_model.predict(X_test)
     rf_f1    = f1_score(y_test, rf_pred, average="macro")
-    print(f"  RF  best CV macro F1 : {rf_search.best_score_:.4f}  |  Test macro F1: {rf_f1:.4f}")
+    print(f"  RF  CV macro F1: {rf_search.best_score_:.4f}  Test macro F1: {rf_f1:.4f}")
 
     # ── Model 2: XGBoost ──────────────────────────────────────────────────
     print("  Training XGBoost...")
-    xgb_params = {
-        "n_estimators"    : [100, 200, 300],
-        "max_depth"       : [3, 4, 5, 6],
-        "learning_rate"   : [0.01, 0.05, 0.1],
-        "subsample"       : [0.7, 0.8, 1.0],
-        "colsample_bytree": [0.7, 0.8, 1.0],
-    }
-
     xgb_search = RandomizedSearchCV(
-        XGBClassifier(
-            random_state=42,
-            eval_metric="mlogloss",
-            n_jobs=-1,
-            use_label_encoder=False,
-        ),
-        xgb_params,
-        n_iter=15, cv=5,
-        scoring="f1_macro",
+        XGBClassifier(random_state=42, eval_metric="logloss", n_jobs=-1),
+        {"n_estimators":[100,200,300],"max_depth":[3,4,5,6],
+         "learning_rate":[0.01,0.05,0.1],"subsample":[0.7,0.8,1.0],
+         "colsample_bytree":[0.7,0.8,1.0]},
+        n_iter=15, cv=5, scoring="f1_macro",
         random_state=42, n_jobs=-1, verbose=0,
     )
     xgb_search.fit(X_train_res, y_train_res)
     xgb_model = xgb_search.best_estimator_
     xgb_pred  = xgb_model.predict(X_test)
     xgb_f1    = f1_score(y_test, xgb_pred, average="macro")
-    print(f"  XGB best CV macro F1 : {xgb_search.best_score_:.4f}  |  Test macro F1: {xgb_f1:.4f}")
+    print(f"  XGB CV macro F1: {xgb_search.best_score_:.4f}  Test macro F1: {xgb_f1:.4f}")
 
-    # ── Pick best model ───────────────────────────────────────────────────
+    # ── Pick best ─────────────────────────────────────────────────────────
     if rf_f1 >= xgb_f1:
-        model       = rf_model
-        y_pred      = rf_pred
-        model_name  = "RandomForest"
-        best_params = rf_search.best_params_
-        best_cv_f1  = rf_search.best_score_
+        model, y_pred = rf_model, rf_pred
+        model_name, best_cv_f1 = "RandomForest", rf_search.best_score_
         print(f"\n  Selected: RandomForest (macro F1: {rf_f1:.4f})")
     else:
-        model       = xgb_model
-        y_pred      = xgb_pred
-        model_name  = "XGBoost"
-        best_params = xgb_search.best_params_
-        best_cv_f1  = xgb_search.best_score_
+        model, y_pred = xgb_model, xgb_pred
+        model_name, best_cv_f1 = "XGBoost", xgb_search.best_score_
         print(f"\n  Selected: XGBoost (macro F1: {xgb_f1:.4f})")
 
     acc      = accuracy_score(y_test, y_pred)
     f1_macro = f1_score(y_test, y_pred, average="macro")
-    f1_neutral = f1_score(y_test, y_pred, labels=[le.transform(["Neutral"])[0]], average="macro")
+    try:
+        y_proba = model.predict_proba(X_test)[:,1]
+        auc     = roc_auc_score(y_test, y_proba)
+    except Exception:
+        auc = 0.0
 
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
-    with mlflow.start_run(run_name=f"sentiment_{model_name.lower()}_v2"):
+    with mlflow.start_run(run_name=f"sentiment_{model_name.lower()}_v3"):
         mlflow.log_params({
-            "model"         : model_name,
-            "best_params"   : str(best_params),
-            "smote"         : True,
-            "class_weight"  : "balanced",
-            "imbalance_fix" : "SMOTE + class_weight + macro F1 scoring",
-            "features"      : str(features),
+            "model"        : model_name,
+            "smote"        : True,
+            "class_weight" : "balanced",
+            "classes"      : "2-class: Positive vs Not Positive",
+            "version"      : "v3 - merged Neutral into Not Positive",
+            "features"     : str(features),
         })
         mlflow.log_metrics({
-            "accuracy"      : acc,
-            "f1_macro"      : f1_macro,
-            "f1_neutral"    : f1_neutral,
-            "cv_best_f1"    : best_cv_f1,
+            "accuracy"  : acc,
+            "f1_macro"  : f1_macro,
+            "roc_auc"   : auc,
+            "cv_best_f1": best_cv_f1,
         })
-        mlflow.sklearn.log_model(model, name="sentiment_model")
+        mlflow.sklearn.log_model(model, artifact_path="sentiment_model")
 
         print(f"\n  Accuracy   : {acc:.4f}")
         print(f"  Macro F1   : {f1_macro:.4f}")
-        print(f"  Neutral F1 : {f1_neutral:.4f}")
+        print(f"  ROC-AUC    : {auc:.4f}")
         print(f"\n{classification_report(y_test, y_pred, target_names=le.classes_, zero_division=0)}")
 
-    # Save
     joblib.dump(model, os.path.join(MODELS_DIR, "sentiment_model.pkl"))
     joblib.dump(le,    os.path.join(MODELS_DIR, "sentiment_le.pkl"))
     print(f"  Model saved → models/sentiment_model.pkl")
-
     return model, le
 
 
-# ── PREDICT ───────────────────────────────────────────────────────────────────
 def predict(order_data: dict) -> dict:
     model = joblib.load(os.path.join(MODELS_DIR, "sentiment_model.pkl"))
     le    = joblib.load(os.path.join(MODELS_DIR, "sentiment_le.pkl"))
 
-    # Compute derived features
     price    = order_data.get("price", 0)
     freight  = order_data.get("freight_value", 0)
     delay    = order_data.get("delivery_delay_days", 0)
@@ -250,6 +223,8 @@ def predict(order_data: dict) -> dict:
     order_data["very_late"]             = 1 if delay > 7 else 0
     order_data["early_delivery"]        = 1 if delay <= 0 else 0
     order_data["abs_delay_days"]        = abs(delay)
+    order_data["late_and_expensive"]    = 1 if delay > 0 and price > 200 else 0
+    order_data["very_very_late"]        = 1 if delay > 14 else 0
 
     features = [
         "price", "freight_value",
@@ -258,13 +233,14 @@ def predict(order_data: dict) -> dict:
         "is_late", "freight_ratio",
         "price_per_installment", "very_late",
         "early_delivery", "abs_delay_days",
+        "late_and_expensive", "very_very_late",
     ]
 
-    X       = pd.DataFrame([order_data])[features].fillna(0)
-    pred    = model.predict(X)[0]
-    proba   = model.predict_proba(X)[0]
-    label   = le.inverse_transform([pred])[0]
-    conf    = round(float(proba.max()), 4)
+    X     = pd.DataFrame([order_data])[features].fillna(0)
+    pred  = model.predict(X)[0]
+    proba = model.predict_proba(X)[0]
+    label = le.inverse_transform([pred])[0]
+    conf  = round(float(proba.max()), 4)
 
     return {
         "sentiment"    : label,
