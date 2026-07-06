@@ -14,12 +14,37 @@
 An end-to-end Business Intelligence and Machine Learning pipeline built on the real **Olist Brazilian E-Commerce** dataset from Kaggle (100,000+ real orders, 2016–2018).
 
 The project covers the full data engineering and ML lifecycle:
-- Raw data ingestion from 9 CSV files
-- ETL pipeline with data cleaning and transformation
-- PostgreSQL star schema data warehouse
-- 4 machine learning models with MLflow experiment tracking
-- REST API serving analytics and ML predictions
-- Interactive Power BI dashboard
+
+- Built end-to-end ETL pipeline processing 100K+ real Brazilian
+  e-commerce orders from 9 CSV sources into a PostgreSQL star schema
+  warehouse (6 tables, 112K+ rows) using Python and Pandas
+
+- Designed star schema data warehouse with fact + 4 dimension tables +
+  geolocation; created 8 query indexes reducing execution time by ~60%
+
+- Trained XGBoost churn model (ROC-AUC 0.76) on 96K customers — identified
+  and resolved data leakage caused by target-derived feature (recency_days)
+  that was producing a misleading ROC-AUC of 1.00
+
+- Applied SMOTE oversampling + threshold tuning to Gradient Boosting
+  delivery delay classifier, improving Late class recall from 2% to 55%+
+  on a severely imbalanced dataset (93:7 class ratio)
+
+- Built Prophet revenue forecasting model with monthly seasonality and
+  95% confidence intervals; cross-validated on 24 months of time-series data
+
+- Tracked all ML experiments with MLflow — parameters, metrics, and model
+  artifacts versioned across 4 models and multiple training runs
+
+- Exposed 14 REST API endpoints (10 analytics + 4 ML predictions) via
+  FastAPI with Pydantic validation and auto-generated Swagger documentation
+
+- Built interactive Power BI dashboard connected live to PostgreSQL with
+  KPI cards, revenue trend chart, geolocation map, and slicers for
+  year, category, and state filtering
+
+- Performed RFM customer segmentation identifying 5 cohorts (Champions,
+  Loyal, Potential, At Risk, Lost) across 96K+ unique customers
 
 ---
 
