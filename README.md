@@ -90,13 +90,32 @@ Power BI — Interactive Dashboard
 
 ## ML Models
 
-| Model | Algorithm | Type | Metric |
-|---|---|---|---|
-| Customer Churn | XGBoost | Binary Classification | ROC-AUC: 1.00 |
-| Sales Forecast | Prophet / Holt-Winters | Time Series | MAPE: ~8% |
-| Delivery Delay | Gradient Boosting | Binary Classification | ROC-AUC: 0.77 |
-| Review Sentiment | Random Forest | Multi-class Classification | Accuracy: 79.6% |
+| Model | Algorithm | Type | Metric | Notes |
+|---|---|---|---|---|
+| Customer Churn | XGBoost | Binary Classification | ROC-AUC: 0.76 | Fixed data leakage — removed recency_days |
+| Sales Forecast | Prophet | Time Series | MAPE: ~15-25% | Monthly seasonality, 95% CI |
+| Delivery Delay | Gradient Boosting / RF / XGBoost | Binary Classification | Late Recall: ~55% | Fixed class imbalance with SMOTE |
+| Review Sentiment | Random Forest | Binary Classification | Macro F1: ~0.72 | 2-class: Positive vs Not Positive |
 
+
+### Key ML Challenges Identified and Fixed
+ 
+**1. Data Leakage — Churn Model**
+- Problem: `recency_days` was used as a feature while also defining the churn target (`recency_days > 180`), producing a misleading ROC-AUC of 1.00
+- Fix: Dropped `recency_days` from features entirely, added behavioral features instead
+- Result: ROC-AUC dropped to honest 0.76
+**2. Class Imbalance — Delivery Model**
+- Problem: 93.4% On-time vs 6.6% Late — model predicted everything as On-time, Late recall was only 2%
+- Fix: SMOTE oversampling + `compute_sample_weight` + threshold tuning targeting Late recall ≥ 55%
+- Result: Late recall improved from 2% to 55%+
+**3. Neutral Class Never Predicted — Sentiment Model**
+- Problem: 3-class model (Positive/Neutral/Negative) ignored Neutral (8.3% of data)
+- Fix: Merged Neutral into Not Positive (2-class), added interaction features
+- Result: Macro F1 improved from 0.44 to ~0.72
+**4. Forecast MAPE 48,508% — Forecast Model**
+- Problem: Yearly seasonality unreliable with only 24 months of data
+- Fix: Disabled yearly seasonality, added manual monthly seasonality instead
+- Result: MAPE dropped to ~15-25%, no negative revenue forecasts
 ---
 
 ## Dataset
@@ -348,7 +367,25 @@ dim_sellers ──────────┐             │           │     
 | 06_sentiment_analysis.ipynb | Sentiment distribution, by category, model results |
 
 ---
-
+## Files Created After Running
+ 
+```
+models/
+├── churn_model.pkl          ← XGBoost churn model
+├── churn_scaler.pkl         ← StandardScaler for churn features
+├── forecast_model.json      ← Prophet model (JSON — not pkl)
+├── forecast_results.csv     ← Full forecast with confidence intervals
+├── delivery_model.pkl       ← Best of GB / RF / XGBoost
+├── delivery_le_cust.pkl     ← LabelEncoder for customer states
+├── delivery_le_seller.pkl   ← LabelEncoder for seller states
+├── sentiment_model.pkl      ← Random Forest sentiment model
+└── sentiment_le.pkl         ← LabelEncoder for sentiment classes
+ 
+mlflow_tracking/
+└── mlflow.db                ← All experiment logs and metrics
+ 
+mlruns/                      ← MLflow artifact store (auto-created)
+```
 
 ---
 
