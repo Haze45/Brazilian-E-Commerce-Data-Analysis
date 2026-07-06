@@ -104,18 +104,22 @@ Power BI — Interactive Dashboard
 - Problem: `recency_days` was used as a feature while also defining the churn target (`recency_days > 180`), producing a misleading ROC-AUC of 1.00
 - Fix: Dropped `recency_days` from features entirely, added behavioral features instead
 - Result: ROC-AUC dropped to honest 0.76
+  
 **2. Class Imbalance — Delivery Model**
 - Problem: 93.4% On-time vs 6.6% Late — model predicted everything as On-time, Late recall was only 2%
 - Fix: SMOTE oversampling + `compute_sample_weight` + threshold tuning targeting Late recall ≥ 55%
 - Result: Late recall improved from 2% to 55%+
+  
 **3. Neutral Class Never Predicted — Sentiment Model**
 - Problem: 3-class model (Positive/Neutral/Negative) ignored Neutral (8.3% of data)
 - Fix: Merged Neutral into Not Positive (2-class), added interaction features
 - Result: Macro F1 improved from 0.44 to ~0.72
+  
 **4. Forecast MAPE 48,508% — Forecast Model**
 - Problem: Yearly seasonality unreliable with only 24 months of data
 - Fix: Disabled yearly seasonality, added manual monthly seasonality instead
 - Result: MAPE dropped to ~15-25%, no negative revenue forecasts
+
 ---
 
 ## Dataset
