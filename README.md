@@ -270,10 +270,10 @@ python ml/train_all.py
 
 Expected output:
 ```
-churn        ✅ Success  (ROC-AUC: 1.00)
-forecast     ✅ Success  (MAPE: ~8%)
-delivery     ✅ Success  (ROC-AUC: 0.77)
-sentiment    ✅ Success  (Accuracy: 79.6%)
+churn        ✅ Success  (ROC-AUC: 0.76)
+forecast     ✅ Success  (MAPE: ~15-25%)
+delivery     ✅ Success  (Late Recall: ~55%)
+sentiment    ✅ Success  (Macro F1: ~0.72)
 ```
 
 ### Step 10 — Start FastAPI server
