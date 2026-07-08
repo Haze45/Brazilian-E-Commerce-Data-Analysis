@@ -14,12 +14,37 @@
 An end-to-end Business Intelligence and Machine Learning pipeline built on the real **Olist Brazilian E-Commerce** dataset from Kaggle (100,000+ real orders, 2016–2018).
 
 The project covers the full data engineering and ML lifecycle:
-- Raw data ingestion from 9 CSV files
-- ETL pipeline with data cleaning and transformation
-- PostgreSQL star schema data warehouse
-- 4 machine learning models with MLflow experiment tracking
-- REST API serving analytics and ML predictions
-- Interactive Power BI dashboard
+
+- Built end-to-end ETL pipeline processing 100K+ real Brazilian
+  e-commerce orders from 9 CSV sources into a PostgreSQL star schema
+  warehouse (6 tables, 112K+ rows) using Python and Pandas
+
+- Designed star schema data warehouse with fact + 4 dimension tables +
+  geolocation; created 8 query indexes reducing execution time by ~60%
+
+- Trained XGBoost churn model (ROC-AUC 0.76) on 96K customers — identified
+  and resolved data leakage caused by target-derived feature (recency_days)
+  that was producing a misleading ROC-AUC of 1.00
+
+- Applied SMOTE oversampling + threshold tuning to Gradient Boosting
+  delivery delay classifier, improving Late class recall from 2% to 55%+
+  on a severely imbalanced dataset (93:7 class ratio)
+
+- Built Prophet revenue forecasting model with monthly seasonality and
+  95% confidence intervals; cross-validated on 24 months of time-series data
+
+- Tracked all ML experiments with MLflow — parameters, metrics, and model
+  artifacts versioned across 4 models and multiple training runs
+
+- Exposed 14 REST API endpoints (10 analytics + 4 ML predictions) via
+  FastAPI with Pydantic validation and auto-generated Swagger documentation
+
+- Built interactive Power BI dashboard connected live to PostgreSQL with
+  KPI cards, revenue trend chart, geolocation map, and slicers for
+  year, category, and state filtering
+
+- Performed RFM customer segmentation identifying 5 cohorts (Champions,
+  Loyal, Potential, At Risk, Lost) across 96K+ unique customers
 
 ---
 
@@ -65,12 +90,35 @@ Power BI — Interactive Dashboard
 
 ## ML Models
 
-| Model | Algorithm | Type | Metric |
-|---|---|---|---|
-| Customer Churn | XGBoost | Binary Classification | ROC-AUC: 1.00 |
-| Sales Forecast | Prophet / Holt-Winters | Time Series | MAPE: ~8% |
-| Delivery Delay | Gradient Boosting | Binary Classification | ROC-AUC: 0.77 |
-| Review Sentiment | Random Forest | Multi-class Classification | Accuracy: 79.6% |
+| Model | Algorithm | Type | Metric | Notes |
+|---|---|---|---|---|
+| Customer Churn | XGBoost | Binary Classification | ROC-AUC: 0.76 | Fixed data leakage — removed recency_days |
+| Sales Forecast | Prophet | Time Series | MAPE: ~15-25% | Monthly seasonality, 95% CI |
+| Delivery Delay | Gradient Boosting / RF / XGBoost | Binary Classification | Late Recall: ~55% | Fixed class imbalance with SMOTE |
+| Review Sentiment | Random Forest | Binary Classification | Macro F1: ~0.72 | 2-class: Positive vs Not Positive |
+
+
+### Key ML Challenges Identified and Fixed
+ 
+**1. Data Leakage — Churn Model**
+- Problem: `recency_days` was used as a feature while also defining the churn target (`recency_days > 180`), producing a misleading ROC-AUC of 1.00
+- Fix: Dropped `recency_days` from features entirely, added behavioral features instead
+- Result: ROC-AUC dropped to honest 0.76
+  
+**2. Class Imbalance — Delivery Model**
+- Problem: 93.4% On-time vs 6.6% Late — model predicted everything as On-time, Late recall was only 2%
+- Fix: SMOTE oversampling + `compute_sample_weight` + threshold tuning targeting Late recall ≥ 55%
+- Result: Late recall improved from 2% to 55%+
+  
+**3. Neutral Class Never Predicted — Sentiment Model**
+- Problem: 3-class model (Positive/Neutral/Negative) ignored Neutral (8.3% of data)
+- Fix: Merged Neutral into Not Positive (2-class), added interaction features
+- Result: Macro F1 improved from 0.44 to ~0.72
+  
+**4. Forecast MAPE 48,508% — Forecast Model**
+- Problem: Yearly seasonality unreliable with only 24 months of data
+- Fix: Disabled yearly seasonality, added manual monthly seasonality instead
+- Result: MAPE dropped to ~15-25%, no negative revenue forecasts
 
 ---
 
@@ -222,10 +270,10 @@ python ml/train_all.py
 
 Expected output:
 ```
-churn        ✅ Success  (ROC-AUC: 1.00)
-forecast     ✅ Success  (MAPE: ~8%)
-delivery     ✅ Success  (ROC-AUC: 0.77)
-sentiment    ✅ Success  (Accuracy: 79.6%)
+churn        ✅ Success  (ROC-AUC: 0.76)
+forecast     ✅ Success  (MAPE: ~15-25%)
+delivery     ✅ Success  (Late Recall: ~55%)
+sentiment    ✅ Success  (Macro F1: ~0.72)
 ```
 
 ### Step 10 — Start FastAPI server
@@ -323,7 +371,25 @@ dim_sellers ──────────┐             │           │     
 | 06_sentiment_analysis.ipynb | Sentiment distribution, by category, model results |
 
 ---
-
+## Files Created After Running
+ 
+```
+models/
+├── churn_model.pkl          ← XGBoost churn model
+├── churn_scaler.pkl         ← StandardScaler for churn features
+├── forecast_model.json      ← Prophet model (JSON — not pkl)
+├── forecast_results.csv     ← Full forecast with confidence intervals
+├── delivery_model.pkl       ← Best of GB / RF / XGBoost
+├── delivery_le_cust.pkl     ← LabelEncoder for customer states
+├── delivery_le_seller.pkl   ← LabelEncoder for seller states
+├── sentiment_model.pkl      ← Random Forest sentiment model
+└── sentiment_le.pkl         ← LabelEncoder for sentiment classes
+ 
+mlflow_tracking/
+└── mlflow.db                ← All experiment logs and metrics
+ 
+mlruns/                      ← MLflow artifact store (auto-created)
+```
 
 ---
 
@@ -340,4 +406,3 @@ python -m mlflow ui --backend-store-uri sqlite:///mlflow_tracking/mlflow.db
 ```
 
 ---
-
